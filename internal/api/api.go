@@ -8,11 +8,16 @@ package api
 
 import (
 	_ "embed"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -26,8 +31,9 @@ import (
 
 // Server holds the API's dependencies.
 type Server struct {
-	reg *registry.Registry
-	log *slog.Logger
+	reg   *registry.Registry
+	log   *slog.Logger
+	cache *interfaceCache
 }
 
 // NewServer builds an API server over a registry.
@@ -35,7 +41,7 @@ func NewServer(reg *registry.Registry, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{reg: reg, log: log}
+	return &Server{reg: reg, log: log, cache: newInterfaceCache(interfaceCacheBytes)}
 }
 
 // Routes returns the API's routes, to be mounted under /api.
@@ -44,7 +50,10 @@ func (s *Server) Routes() chi.Router {
 
 	r.Get("/contracts", s.listContracts)
 	r.Post("/contracts", s.registerContract)
+	r.Get("/wasm/{hash}", s.getWasmSpec)
+	r.Post("/wasm/{hash}", s.catalogWasm)
 	r.Get("/contracts/{id}", s.getContract)
+	r.Put("/contracts/{id}/source", s.updateContractSource)
 	r.Post("/contracts/{id}/refresh", s.refreshContract)
 	r.Get("/contracts/{id}/versions", s.listVersions)
 	r.Get("/contracts/{id}/functions/{fn}", s.getFunction)
@@ -52,6 +61,77 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/openapi.json", serveOpenAPI)
 
 	return r
+}
+
+var commitHash = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
+
+func (s *Server) getWasmSpec(w http.ResponseWriter, r *http.Request) {
+	wasmHash := strings.TrimSpace(chi.URLParam(r, "hash"))
+	rawHash, err := hex.DecodeString(wasmHash)
+	if err != nil || len(rawHash) != 32 {
+		writeError(w, http.StatusBadRequest, "invalid wasm hash")
+		return
+	}
+	wasmHash = hex.EncodeToString(rawHash)
+	network, err := s.network(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	stored, err := s.reg.Store().GetWasmSpec(r.Context(), network, wasmHash)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stored)
+}
+
+func (s *Server) catalogWasm(w http.ResponseWriter, r *http.Request) {
+	result, err := s.reg.CatalogWasm(r.Context(), chi.URLParam(r, "hash"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	status := http.StatusOK
+	if result.Created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) updateContractSource(w http.ResponseWriter, r *http.Request) {
+	var req sourceRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sourceURL := strings.TrimSpace(req.SourceURL)
+	parsed, err := url.Parse(sourceURL)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		writeError(w, http.StatusBadRequest, "source_url must be an absolute HTTP or HTTPS repository URL")
+		return
+	}
+	commit := strings.TrimSpace(req.SourceCommit)
+	if commit != "" && !commitHash.MatchString(commit) {
+		writeError(w, http.StatusBadRequest, "source_commit must be a 40- or 64-character hexadecimal commit hash")
+		return
+	}
+	network, err := s.network(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	contractID := chi.URLParam(r, "id")
+	if err := s.reg.Store().UpdateSource(r.Context(), network, contractID, sourceURL, commit); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	contract, err := s.reg.Store().GetContract(r.Context(), network, contractID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contract)
 }
 
 // openAPISpec describes every route above. TestOpenAPICoversEveryRoute
@@ -161,21 +241,37 @@ func (s *Server) getContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wasmHash := strings.TrimSpace(r.URL.Query().Get("wasm_hash"))
-	stored, err := s.reg.Store().GetSpec(r.Context(), network, contractID, wasmHash)
-	if err != nil {
-		s.fail(w, r, err)
-		return
+	cacheHash := wasmHash
+	if cacheHash == "" {
+		cacheHash = contract.CurrentWasmHash
+	}
+	key := specCacheKey{network: network, contractID: contractID, wasmHash: cacheHash}
+	cached, ok := s.cache.get(key)
+	if !ok {
+		stored, err := s.reg.Store().GetSpec(r.Context(), network, contractID, cacheHash)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+
+		body, err := json.Marshal(stored.Interface)
+		if err != nil {
+			s.fail(w, r, fmt.Errorf("api: encoding interface for %s: %w", contractID, err))
+			return
+		}
+		cached = cachedInterface{body: body, decodedAt: stored.DecodedAt.UTC()}
+		s.cache.add(key, cached)
 	}
 
 	writeJSON(w, http.StatusOK, contractResponse{
 		ContractID: contract.ContractID,
 		Network:    contract.Network,
-		WasmHash:   stored.WasmHash,
+		WasmHash:   cacheHash,
 		Name:       contract.Name,
 		FirstSeen:  contract.FirstSeen.UTC(),
-		DecodedAt:  stored.DecodedAt.UTC(),
-		Current:    stored.WasmHash == contract.CurrentWasmHash,
-		Interface:  stored.Interface,
+		DecodedAt:  cached.decodedAt,
+		Current:    cacheHash == contract.CurrentWasmHash,
+		Interface:  json.RawMessage(cached.body),
 	})
 }
 
@@ -288,7 +384,7 @@ func (s *Server) network(r *http.Request) (string, error) {
 // failure cannot leak a connection string or query text to a caller.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, store.ErrNotFound), errors.Is(err, stellar.ErrContractNotFound):
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, stellar.ErrContractNotFound), errors.Is(err, stellar.ErrWasmNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 
 	case errors.Is(err, stellar.ErrNoWasm), errors.Is(err, spec.ErrNoSpecSection):
@@ -299,7 +395,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, registry.ErrNetworkMismatch):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 
-	case isBadContractID(err):
+	case isBadContractID(err), errors.Is(err, registry.ErrInvalidWasmHash):
 		writeError(w, http.StatusBadRequest, err.Error())
 
 	case errors.Is(err, r.Context().Err()) && r.Context().Err() != nil:
@@ -330,4 +426,14 @@ func intParam(raw string, fallback int) int {
 		return fallback
 	}
 	return v
+}
+
+// retryAfterSeconds renders a wait as the whole seconds a client should
+// wait before retrying, which is what the Retry-After header asks for.
+func retryAfterSeconds(d time.Duration) int {
+	seconds := int((d + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
 }

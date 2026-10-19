@@ -117,6 +117,26 @@ $ curl -X POST localhost:8080/api/contracts \
 
 Open <http://localhost:8080> for the browse UI.
 
+### Kubernetes with Helm
+
+The chart at [`deploy/helm/sorovault`](deploy/helm/sorovault) deploys the API
+and runs database migrations before install and upgrade. It expects an
+existing PostgreSQL database; it does not install or manage PostgreSQL. Create
+a Secret containing the connection URL, then install the chart:
+
+```console
+$ kubectl create secret generic sorovault-db \\
+  --from-literal=DATABASE_URL='postgres://sorovault:password@postgres:5432/sorovault?sslmode=disable'
+$ helm upgrade --install sorovault ./deploy/helm/sorovault \\
+  --set database.existingSecret=sorovault-db
+```
+
+The secret name and key, image, service, and SoroVault environment settings can
+be overridden in a values file. `RPC_URL`, `NETWORK_PASSPHRASE`, `HTTP_ADDR`,
+`LOG_LEVEL`, `RPC_TIMEOUT`, and `REFRESH_INTERVAL` are exposed under `config`;
+use `extraEnv` for other environment variables. The server and migration Job
+run non-root with read-only root filesystems.
+
 ### Running locally
 
 ```console
@@ -136,6 +156,7 @@ All configuration is environment variables. Only `DATABASE_URL` (or the path in 
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | — | Postgres connection string. **Required** (or set `DATABASE_URL_FILE` to read it from a file). |
+| `MAX_CONCURRENT_REGISTRATIONS` | `4` | how many registrations and refreshes run at once |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint |
 | `NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | the network you expect `RPC_URL` to serve |
 | `HTTP_ADDR` | `:8080` | listen address |
@@ -153,12 +174,41 @@ Set `REFRESH_INTERVAL` (for example `6h`) and `sorovault serve` re-checks, on
 that schedule, every contract on its network that has not been refreshed
 within the interval. An upgraded contract gets a new interface version
 exactly as `POST /api/contracts/{id}/refresh` would record it; an unchanged
-one costs a single `getLedgerEntries` call and is not re-downloaded.
+one costs a single `getLedgerEntries` call and is not re-downloaded. Refreshes
+are spread at even offsets across the interval to avoid an RPC traffic burst.
 
 A contract that fails to refresh — expired, or an RPC error — is logged and
 skipped, and the sweep carries on. One sweep runs at startup and then one per
 interval; a sweep in progress at shutdown is cancelled before the database is
 closed.
+
+### Bounded registrations
+
+Registering a contract downloads its WASM module and decodes it in memory,
+so the number of registrations running at once is what keeps peak memory
+finite. `MAX_CONCURRENT_REGISTRATIONS` (default `4`) bounds it, across every
+client: the API, the CLI and the background refresher all draw on the same
+budget, because they all download modules.
+
+A request that cannot be given a slot waits a couple of seconds for one and
+is then refused with **503** and a `Retry-After` header, rather than queueing
+without limit:
+
+```console
+$ curl -si -X POST localhost:8080/api/contracts \
+    -H 'content-type: application/json' \
+    -d '{"contract_id":"CDZZ…4PAN"}'
+HTTP/1.1 503 Service Unavailable
+Retry-After: 2
+…
+{"error":"registry: too many registrations in flight: 4 already running"}
+```
+
+The wait is short on purpose: a client that is told to come back shortly is
+better served than one left hanging behind a queue the server cannot drain.
+The refresher treats a busy registry the same way — it skips the contract and
+picks it up on the next sweep, since a contract that was not refreshed stays
+stale.
 
 ## HTTP API
 
@@ -166,7 +216,10 @@ closed.
 |---|---|---|
 | `GET` | `/api/contracts` | list contracts — `?q=`, `?network=`, `?limit=`, `?offset=` |
 | `POST` | `/api/contracts` | register a contract — `{"contract_id": "C…"}` |
+| `POST` | `/api/wasm/{hash}` | catalog uploaded code before a contract runs it |
+| `GET` | `/api/wasm/{hash}` | read a catalogued uploaded-code interface — `?network=` |
 | `GET` | `/api/contracts/{id}` | the decoded ABI — `?network=`, `?wasm_hash=` |
+| `PUT` | `/api/contracts/{id}/source` | attach a `source_url` and optional `source_commit` |
 | `GET` | `/api/contracts/{id}/functions/{fn}` | one function in detail |
 | `GET` | `/api/contracts/{id}/client.ts` | typed TypeScript client — `?wasm_hash=`, `?download=1` |
 | `GET` | `/api/openapi.json` | OpenAPI 3.1 description of this API |
@@ -201,9 +254,10 @@ sorovault add <contract_id>...      # fetch, decode and register
 sorovault refresh <contract_id>...  # re-check for an upgraded interface
 sorovault list                      # -q, --network, --limit, --offset
 sorovault get <contract_id>         # --function, --wasm-hash, --json
-sorovault codegen <contract_id>     # typed TypeScript client; -o, --wasm-hash
+sorovault codegen <contract_id>     # --lang ts|md; -o, --wasm-hash
 sorovault serve                     # JSON API + browse UI
 sorovault migrate                   # apply schema migrations
+sorovault doctor                    # check a deployment's health
 ```
 
 `add` and `refresh` accept several contract IDs and report per-contract
@@ -219,6 +273,44 @@ inputs:
 
 returns: bool
 ```
+
+### `sorovault doctor`
+
+When a deployment misbehaves, the same four questions come up: can it reach
+Postgres, are the migrations up to date, does the RPC endpoint answer, and
+is it serving the network this instance expects. `doctor` answers all four in
+one go:
+
+```console
+$ sorovault doctor
+PASS  database    the database answers
+PASS  migrations  the database is at version 2, the latest is 2
+PASS  rpc         the endpoint is reachable, serving testnet
+PASS  passphrase  the endpoint serves the configured network
+```
+
+Every check runs, so one failure does not hide the others, and the command
+exits non-zero if any of them failed. `--json` emits the same report for a
+script to read:
+
+```console
+$ sorovault doctor --json
+{
+  "ok": false,
+  "checks": [
+    { "name": "database", "ok": true, "detail": "the database answers" },
+    { "name": "migrations", "ok": false, "error": "the database is at version 1, but version 2 is available; run `sorovault migrate`" },
+    { "name": "rpc", "ok": true, "detail": "the endpoint is reachable, serving testnet" },
+    { "name": "passphrase", "ok": true, "detail": "the endpoint serves the configured network" }
+  ]
+}
+```
+
+The command is strictly read-only: it opens a connection and reads, and
+never writes to the database, applies a migration, or changes anything on
+the network. It reads the same configuration as everything else, so a
+deployment missing its `DATABASE_URL` is reported as a configuration error
+rather than a passing check.
 
 ## Typed clients
 
@@ -254,6 +346,24 @@ the SDK unchanged. It requires `@stellar/stellar-sdk` 14 or later and
 CI compiles the generated client for the real testnet fixture with
 `tsc --strict` against a pinned SDK, so a change to the generator that would
 produce broken TypeScript fails the build.
+
+## Markdown documentation
+
+Generate a standalone Markdown reference from a registered contract's ABI,
+including function signatures and comments, user-defined types, events, and
+the selected WASM version:
+
+```console
+$ sorovault codegen CDZZ…4PAN --lang md -o CONTRACT.md
+```
+
+## Uploaded code and source links
+
+`POST /api/wasm/{hash}` catalogs uploaded code by its 64-character SHA-256
+hash, even before a contract instance uses it. Its decoded interface is then
+available from `GET /api/wasm/{hash}`. Attach a contract repository URL and an
+optional 40- or 64-character commit hash with `PUT /api/contracts/{id}/source`;
+the browse page displays the repository and commit with the interface.
 
 ## The ABI JSON
 
@@ -347,7 +457,7 @@ internal/stellar   RPC client and contract fetch
 internal/store     Postgres registry, migrations, and an in-memory store
 internal/registry  register/refresh orchestration
 internal/refresher scheduled re-checks of registered contracts
-internal/codegen   typed client generation from a stored ABI
+internal/codegen   Markdown documentation and typed client generation from a stored ABI
 internal/api       chi JSON handlers
 internal/web       html/template + htmx browse UI
 ```
@@ -362,9 +472,12 @@ why the whole stack can be tested without a network or a database.
 
 ```
 contracts (network, contract_id)  PK
-  current_wasm_hash, name, first_seen, last_refreshed
+  current_wasm_hash, name, source_url, source_commit, first_seen, last_refreshed
 
 specs     (network, contract_id, wasm_hash)  UNIQUE
+  spec jsonb, decoded_at
+
+wasm_specs (network, wasm_hash)  PK
   spec jsonb, decoded_at
 ```
 

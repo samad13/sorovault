@@ -32,6 +32,7 @@ type harness struct {
 	server *httptest.Server
 	fake   *stellartest.Fake
 	reg    *registry.Registry
+	store  *store.Memory
 }
 
 func newHarness(t *testing.T) *harness {
@@ -52,7 +53,7 @@ func newHarness(t *testing.T) *harness {
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 
-	return &harness{server: srv, fake: fake, reg: reg}
+	return &harness{server: srv, fake: fake, reg: reg, store: memory}
 }
 
 func (h *harness) get(t *testing.T, path string) (*http.Response, string) {
@@ -118,6 +119,41 @@ func TestIndexListsContracts(t *testing.T) {
 	assert.Contains(t, body, idA)
 	assert.Contains(t, body, "1 contract")
 	assert.Contains(t, body, `id="contract-rows"`)
+}
+
+func TestIndexNetworkSelectorFiltersResults(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	iface := &model.Interface{
+		ABIVersion: model.ABIVersion,
+		Functions:  []model.Function{},
+		Types: model.Types{
+			Structs: []model.Struct{}, Unions: []model.Union{},
+			Enums: []model.Enum{}, ErrorEnums: []model.ErrorEnum{},
+		},
+		Events: []model.Event{},
+	}
+	for _, c := range []store.Contract{
+		{ContractID: idA, Network: "testnet", CurrentWasmHash: "hash-testnet"},
+		{ContractID: idB, Network: "public", CurrentWasmHash: "hash-public"},
+	} {
+		require.NoError(t, h.reg.Store().Save(context.Background(), c, iface))
+	}
+
+	_, body := h.get(t, "/")
+	assert.Contains(t, body, `<option value="public">public</option>`)
+	assert.Contains(t, body, `<option value="testnet">testnet</option>`)
+	assert.Contains(t, body, `<option value="" selected>All</option>`)
+
+	_, body = h.get(t, "/?network=public")
+	assert.Contains(t, body, idB)
+	assert.NotContains(t, body, idA)
+	assert.Contains(t, body, `<option value="public" selected>public</option>`)
+
+	_, body = h.get(t, "/partials/contracts?network=public")
+	assert.Contains(t, body, idB)
+	assert.NotContains(t, body, idA)
 }
 
 func TestIndexPagination(t *testing.T) {
@@ -198,16 +234,24 @@ func TestContractPage(t *testing.T) {
 
 	h := newHarness(t)
 	h.register(t, idA)
+	require.NoError(t, h.store.UpdateSource(context.Background(), "testnet", idA,
+		"https://github.com/soroworks/sorovault", "0123456789abcdef0123456789abcdef01234567"))
 
 	resp, body := h.get(t, "/contracts/"+idA)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	assert.Contains(t, body, idA)
-	assert.Contains(t, body, "fn has_voted(nullifier: BytesN&lt;32&gt;) -&gt; bool")
-	assert.Contains(t, body, "struct VoteParams")
-	assert.Contains(t, body, "error Error")
+	assert.Contains(t, body, `<span class="sig-function">has_voted</span>`)
+	assert.Contains(t, body, `<span class="sig-parameter">nullifier</span>`)
+	assert.Contains(t, body, `<span class="type-constructor">BytesN</span>`)
+	assert.Contains(t, body, `<span class="type-parameter">32</span>`)
+	assert.Contains(t, body, `<a class="type-reference" href="#type-VoteParams">VoteParams</a>`)
+	assert.Contains(t, body, `<span class="type-definition" id="type-VoteParams">VoteParams</span>`)
+	assert.Contains(t, body, `<span class="type-keyword">error</span> <span class="type-definition" id="type-Error">Error</span>`)
 	assert.Contains(t, body, "Voted", "the event should be listed")
 	assert.Contains(t, body, "rssdkver", "build metadata should be shown")
+	assert.Contains(t, body, `href="https://github.com/soroworks/sorovault"`)
+	assert.Contains(t, body, "0123456789abcdef0123456789abcdef01234567")
 	assert.Contains(t, body, "current")
 	assert.Contains(t, body, "/api/contracts/"+idA+"/client.ts?", "the typed client should be linked")
 }
