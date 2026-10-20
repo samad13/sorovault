@@ -1,5 +1,6 @@
 {
   "openapi": "3.1.0",
+  "servers": [{ "url": "/" }],
   "info": {
     "title": "SoroVault",
     "summary": "A contract interface (ABI) registry for Stellar/Soroban.",
@@ -37,7 +38,7 @@
         ],
         "responses": {
           "200": { "description": "One page of contracts.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ContractList" }, "examples": { "zkvote": { "$ref": "#/components/examples/ContractList" } } } } },
-          "503": { "$ref": "#/components/responses/NetworkMismatch" }
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
         }
       },
       "post": {
